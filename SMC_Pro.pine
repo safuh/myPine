@@ -25,30 +25,30 @@ showInternal = input.bool(true, "Show internal structure", group = groupStruct)
 showExternal = input.bool(true, "Show external structure", group = groupStruct)
 maxStructure = input.int(80, "Structure history", minval = 20, maxval = 150, group = groupStruct)
 
- groupFvg = "02. Fair Value Gaps"
+groupFvg = "02. Fair Value Gaps"
 showFvg = input.bool(true, "Show FVGs", group = groupFvg)
 fvgMinAtr = input.float(0.10, "Minimum FVG size (ATR)", minval = 0.0, step = 0.01, group = groupFvg)
 fvgExtend = input.int(30, "FVG extension bars", minval = 1, maxval = 200, group = groupFvg)
 removeFilledFvg = input.bool(true, "Remove filled FVGs", group = groupFvg)
 
- groupOb = "03. Order Blocks"
+groupOb = "03. Order Blocks"
 showOb = input.bool(true, "Show order blocks", group = groupOb)
 obLookback = input.int(12, "OB search lookback", minval = 1, maxval = 50, group = groupOb)
 obMinImpulseAtr = input.float(0.50, "Minimum displacement (ATR)", minval = 0.0, step = 0.05, group = groupOb)
 obExtend = input.int(40, "OB extension bars", minval = 1, maxval = 200, group = groupOb)
 
- groupLiq = "04. Liquidity"
+groupLiq = "04. Liquidity"
 showLiquidity = input.bool(true, "Show liquidity pools", group = groupLiq)
 showSweeps = input.bool(true, "Show liquidity sweeps", group = groupLiq)
 eqToleranceAtr = input.float(0.12, "Equal high/low tolerance (ATR)", minval = 0.0, step = 0.01, group = groupLiq)
 liqMaxAge = input.int(150, "Liquidity max age (bars)", minval = 10, maxval = 1000, group = groupLiq)
 
- groupHtf = "05. Higher Timeframe"
+groupHtf = "05. Higher Timeframe"
 showHtf = input.bool(true, "Show HTF structure", group = groupHtf)
 htf = input.timeframe("240", "HTF", group = groupHtf)
 htfPivotLen = input.int(2, "HTF fractal length", minval = 1, maxval = 10, group = groupHtf)
 
- groupRisk = "06. Signals"
+groupRisk = "06. Signals"
 showSignals = input.bool(true, "Show confluence signals", group = groupRisk)
 retestAtr = input.float(0.15, "Retest tolerance (ATR)", minval = 0.0, step = 0.01, group = groupRisk)
 showPremiumDiscount = input.bool(true, "Show premium/discount", group = groupRisk)
