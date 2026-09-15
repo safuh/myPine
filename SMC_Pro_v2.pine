@@ -149,8 +149,8 @@ if confirmed and not na(pl)
 // final bias from being an accidental consequence of loop ordering.
 highBreak = false
 lowBreak = false
-highBreakAge = na
-lowBreakAge = na
+int highBreakAge = na
+int lowBreakAge = na
 
 if confirmed and array.size(highs) > 0
     for i = 0 to array.size(highs) - 1
@@ -347,7 +347,7 @@ if confirmed and showOb and (bosUp or bosDn)
     bull = bosUp
     impulse = bull ? close - open : open - close
     if impulse >= safeAtr * obImpulseAtr
-        found = na
+        int found = na
         for j = 1 to obLookback
             opposite = bull ? close[j] < open[j] : close[j] > open[j]
             if opposite
@@ -427,8 +427,8 @@ if sweepLow and showSweeps
 // structure event exists; otherwise use the latest confirmed opposite pivots.
 // ============================================================================
 var line eqLine = na
-rangeHigh = na
-rangeLow = na
+float rangeHigh = na
+float rangeLow = na
 if bias == 1 and not na(protectedLevel) and not na(lastBrokenHighIndex)
     rangeLow := protectedLevel
     rangeHigh := array.get(highs, lastBrokenHighIndex).price
