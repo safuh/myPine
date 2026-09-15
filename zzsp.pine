@@ -1,0 +1,515 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © safuh8
+
+//@version=6
+import safuh8/ZZSLib/42 as fs
+
+
+indicator("ZZSP", overlay=true, max_lines_count=500)
+
+// ==============================
+// Inputs
+// ==============================
+
+
+tf1 = input.timeframe("240", "TF 1 (must be >= chart TF)",tooltip="Only higher timeframes allowed to avoid data loss")
+tf2 = input.timeframe("960", "TF 2 (must be >= chart TF)",tooltip="Only higher timeframes allowed to avoid data loss")
+length = 2
+chartTfSec = timeframe.in_seconds(timeframe.period)
+tf1Sec     = timeframe.in_seconds(tf1)
+tf2Sec     = timeframe.in_seconds(tf2)
+isTf1Valid = tf1Sec >= chartTfSec
+isTf2Valid = tf2Sec >= chartTfSec
+if not isTf1Valid or not isTf2Valid
+    label.new(
+        bar_index, high,
+        "⚠ Invalid TF: Only HTF overlays allowed\nAdjust inputs",
+        style=label.style_label_down,
+        color=color.red,
+        textcolor=color.white
+    )
+    //runtime.error("Timeframe Overlay must be >= chart timeframe")
+
+type Swing
+    float price
+    int   timeStamp
+    int idx
+	float openPrice
+    float closePrice
+    float highLowPrice
+    int   swingType   // 1 high, -1 low
+    float atrVal
+    bool isActive
+    bool isBroken
+    bool isBreakerSwing
+    //base opp swings (prev Low and Low after current high)
+    float prevOppPrice
+    float oppPrice
+    int oppTime
+    int prevOppTime
+
+    //current swing breaker
+    float breakerSwingPrice
+    int breakerSwingTime
+
+    
+    float finalExtremePrice//after swing break
+    int finalExtremeTime
+
+    bool reTestFound
+    bool retestBosFound
+    bool retestWindowEnded
+    int retestTime
+    float retestPrice
+    bool isRetest
+    
+    bool breakerSwingWithLiquidity
+    
+    float extremeExtension
+    bool isDrawn
+    bool protectedSwingBroken
+    float protectedPrice
+    int  protectedTime
+
+
+
+drawTimeLine(t1,y1,t2,y2,col)=>
+    line.new(t1,y1,t2,y2,xloc=xloc.bar_time,width=2,color=col)
+
+//=========================
+//=========================
+classifyStructs(atrVal,array<Swing> swings,Swing s)=>
+    // ====================================================
+    // FIND BOS / START IMPULSE
+    // ====================================================
+
+    for i = 0 to array.size(swings) - 1
+
+        swing = array.get(swings, i)
+
+        // Must be the same swing type
+        if swing.swingType != s.swingType
+            continue
+
+        // Already broken structures are not candidates,
+        // but they must NOT terminate the search.
+        else if swing.isBroken
+            break
+
+        bool brokeSwing =(
+            (s.swingType == 1 and
+            s.price > swing.price + atrVal * 0.24) or
+            (s.swingType == -1 and
+            s.price < swing.price - atrVal * 0.24))
+
+        if not brokeSwing
+            continue
+
+        // ====================================================
+        // FIRST VALID BOS
+        // ====================================================
+
+        swing.isBroken := true
+
+        // New swing becomes the breaker
+        swing.breakerSwingPrice := s.price
+        swing.breakerSwingTime := s.timeStamp
+
+        s.isBreakerSwing := true
+
+        // ====================================================
+        // PREVIOUS OPPOSITE
+        // ====================================================
+
+        if na(swing.prevOppPrice)
+
+            for j = i to array.size(swings) - 1
+
+                prevSwing = array.get(swings, j)
+
+                if prevSwing.swingType != swing.swingType
+                    swing.prevOppPrice := prevSwing.price
+                    swing.prevOppTime := prevSwing.timeStamp
+                    
+                    break
+
+        // ====================================================
+        // CURRENT OPPOSITE
+        // ====================================================
+
+        if na(swing.oppPrice)
+
+            for k = 0 to array.size(swings) - 1
+
+                oppSwing = array.get(swings, k)
+                if oppSwing.swingType != swing.swingType
+                    swing.oppPrice := oppSwing.price
+                    swing.oppTime := oppSwing.timeStamp
+                    break
+
+        // ====================================================
+        // PROTECTED PRICE
+        // ====================================================
+
+        if na(swing.protectedPrice)
+
+            if not na(swing.oppPrice) and not na(swing.prevOppPrice)
+
+                if swing.swingType == 1
+
+                    if swing.oppPrice < swing.prevOppPrice
+                        swing.protectedPrice := swing.oppPrice
+                        swing.protectedTime := swing.oppTime
+                    else
+                        swing.protectedPrice := swing.prevOppPrice
+                        swing.protectedTime := swing.prevOppTime
+
+                else
+
+                    if swing.oppPrice > swing.prevOppPrice
+                        swing.protectedPrice := swing.oppPrice
+                        swing.protectedTime := swing.oppTime
+                    else
+                        swing.protectedPrice := swing.prevOppPrice
+                        swing.protectedTime := swing.prevOppTime
+
+            else if not na(swing.oppPrice)
+
+                swing.protectedPrice := swing.oppPrice
+                swing.protectedTime := swing.oppTime
+
+            else if not na(swing.prevOppPrice)
+
+                swing.protectedPrice := swing.prevOppPrice
+                swing.protectedTime := swing.prevOppTime
+
+        // ====================================================
+        // GET MARKET STRUCTURE first retest
+        // ====================================================
+
+        for k = i + 1 to array.size(swings) - 1
+
+            prevsame = array.get(swings, k)
+
+            if prevsame.swingType != swing.swingType
+                continue
+            if prevsame.protectedSwingBroken
+                continue
+            if na(prevsame.breakerSwingPrice)
+                continue
+            if prevsame.retestBosFound
+                continue
+            if not prevsame.reTestFound
+                continue
+            if prevsame.isRetest
+                continue
+            if na(prevsame.retestPrice)
+                continue
+            if prevsame.retestTime!=swing.oppTime and prevsame.retestTime != swing.prevOppTime
+                continue
+            prevsame.retestBosFound:=true
+            swingRange=math.abs(prevsame.protectedPrice-prevsame.finalExtremePrice)
+            fiblvl=math.abs(prevsame.protectedPrice-swing.price)/swingRange
+            if fiblvl<0.382
+            //swing.isRetest:=true
+                line.new(
+                    prevsame.protectedTime,
+                    prevsame.protectedPrice,
+                    swing.protectedTime,
+                    swing.protectedPrice,
+                    xloc = xloc.bar_time,
+                    color = swing.swingType==1?color.blue:color.red,
+                    width = 2,
+                    style = line.style_dotted
+                )
+                line.new(
+                    swing.finalExtremeTime,
+                    swing.finalExtremePrice,
+                    swing.protectedTime,
+                    swing.protectedPrice,
+                    xloc = xloc.bar_time,
+                    color = swing.swingType==1?color.blue:color.red,
+                    width = 2
+                )
+            
+        ///line.new(swing.timeStamp,swing.price,s.timeStamp,swing.price,xloc = xloc.bar_time,color = swing.swingType==1?color.blue:color.red,width = 2,style = line.style_dotted)
+        array.set(swings, i, swing)
+        break
+        
+    // ====================================================
+    // CHECK for retest
+    // ====================================================
+
+    for i = 0 to array.size(swings) - 1
+
+        swing = array.get(swings, i)
+        if swing.swingType == s.swingType
+            continue
+        if not swing.isBroken
+            continue
+        if swing.protectedSwingBroken
+            continue
+        if swing.reTestFound
+            continue        
+        if na(swing.finalExtremePrice)
+            continue
+        swingRange=math.abs(swing.breakerSwingPrice-swing.protectedPrice)
+
+        fiblvl=math.abs(swing.protectedPrice-s.price)/swingRange
+        tolerance = atrVal * 0.10
+        fib382 = swing.protectedPrice +(swing.breakerSwingPrice - swing.protectedPrice) * 0.382
+
+        bool retestFound = math.abs(s.price - swing.protectedPrice) <= tolerance or
+         (
+             s.price >= math.min(swing.protectedPrice, fib382) and
+             s.price <= math.max(swing.protectedPrice, fib382)//fiblvl<=0.382
+         )
+        if not retestFound
+            continue
+        swing.reTestFound:=true
+        swing.retestPrice:=s.price
+        swing.retestTime:=s.timeStamp
+        
+        array.set(swings, i, swing)
+    // ====================================================
+    // Invalidate retest bos check
+    // ====================================================
+
+    for i = 0 to array.size(swings) - 1
+        swing = array.get(swings, i)
+        if swing.swingType != s.swingType
+            continue
+        if not swing.isBroken
+            continue
+        if swing.protectedSwingBroken
+            continue
+        if not swing.reTestFound
+            continue
+        if swing.retestBosFound
+            continue
+        if swing.retestWindowEnded
+            continue
+        swingRange=math.abs(swing.breakerSwingPrice-swing.protectedPrice)
+        retest_window_ended=(
+            (swing.swingType==1 and s.price > swing.price+atrVal*1.8) or 
+            (swing.swingType==-1 and s.price < swing.price-atrVal*1.8)
+        )
+        if not retest_window_ended
+            continue
+        swing.retestWindowEnded:=true
+        
+    // ====================================================
+    // CHECK for liquidity sweep and fib relevant swing before strong extenstion
+    // ====================================================
+
+    for i = 0 to array.size(swings) - 1
+
+        swing = array.get(swings, i)
+    // ====================================================
+    // CHECK extreme before retest
+    // ====================================================
+
+    for i = 0 to array.size(swings) - 1
+
+        swing = array.get(swings, i)
+        
+        if swing.swingType != s.swingType
+            continue
+
+        if not swing.isBroken
+            continue
+        if swing.protectedSwingBroken
+            continue
+        if swing.reTestFound
+            continue
+        extreme_found=(
+            (na(swing.finalExtremePrice) and s.timeStamp>swing.breakerSwingTime and 
+            ((swing.swingType==1 and s.price > swing.breakerSwingPrice) or 
+            (swing.swingType==-1 and s.price < swing.breakerSwingPrice))
+        ) or(
+            (swing.swingType==1 and s.price > swing.finalExtremePrice) or 
+            (swing.swingType==-1 and s.price < swing.finalExtremePrice)
+        )
+        )
+        if not extreme_found
+            continue
+        swing.finalExtremePrice:=s.price
+        swing.finalExtremeTime:=s.timeStamp
+        
+        array.set(swings, i, swing)
+
+
+    // ====================================================
+    // CHECK PROTECTED SWING BREAK
+    // ====================================================
+
+    for i = 0 to array.size(swings) - 1
+
+        swing = array.get(swings, i)
+
+        if swing.swingType == s.swingType
+            continue
+
+        if not swing.isBroken
+            continue
+
+        if swing.protectedSwingBroken
+            continue
+
+        if na(swing.protectedPrice)
+            continue
+
+        bool broken =(
+            (swing.swingType == 1 and
+            s.price < swing.protectedPrice - atrVal * 0.24) or
+            (swing.swingType == -1 and
+            s.price > swing.protectedPrice + atrVal * 0.24))
+
+        if not broken
+            continue
+
+        swing.protectedSwingBroken := true
+
+        // Persist state
+        array.set(swings, i, swing)
+
+    s
+
+getTFPivots(int _len)=>
+    ph = ta.pivothigh(high, _len, _len)
+    pl = ta.pivotlow(low, _len, _len)
+
+    phPivotTime = not na(ph) ? time[_len] : na
+    plPivotTime = not na(pl) ? time[_len] : na
+
+    phidx = not na(ph) ? bar_index - _len : na
+    plidx = not na(pl) ? bar_index - _len : na
+
+    // ✅ Close at pivot candle (IMPORTANT: use [_len])
+    phClose = not na(ph) ? close[_len] : na
+    plClose = not na(pl) ? close[_len] : na
+
+	phOpen = not na(ph) ? open[_len] : na
+    plOpen = not na(pl) ? open[_len] : na
+
+    phLow = not na(ph) ? low[_len] : na
+    plHigh = not na(pl) ? high[_len] : na
+
+    [ph, pl, phPivotTime, plPivotTime, phidx, plidx, phClose, plClose, phLow, plHigh, phOpen, plOpen]
+process(atrVal,array<Swing> swings,bool swingPresent=false,float price=na, int timeStamp=na,int idx=na,float openPrice=na,float closePrice=na, float oppPrice=na, int swingType=na,color col=color.blue,bool drawBool=false) =>
+
+    if swingPresent
+        Swing s = Swing.new(price, timeStamp,idx,openPrice,closePrice,oppPrice, swingType,atrVal,true,false,false)
+        if array.size(swings)>0
+            s:=classifyStructs(atrVal,swings,s)
+        // draw structure (ONLY for alternating swings)
+        if array.size(swings) > 0
+            last = array.get(swings, 0)
+            if drawBool
+                drawTimeLine(last.timeStamp, last.price, timeStamp, price,col)
+        // store ALWAYS
+        array.unshift(swings, s)
+        s
+    else
+        na
+processSwing(
+	float atrVal,
+    array<Swing> swings,
+    float ph, float pl,
+    int tfPhTime, int tfPlTime,
+    int tfPhidx, int tfPlidx,
+	float tfPhopen, float tfPlopen,
+    float tfPhclose, float tfPlclose,
+    float tfPhLow, float tfPlHigh,
+    color col,bool drawBool) =>
+
+    Swing newSwing = na
+
+    // === Persistent deduplication ===
+    var int lastProcessedTimeHigh = na
+    var int lastProcessedTimeLow  = na
+
+    // === Detect valid new events ===
+    bool newHigh = not na(ph) and (na(lastProcessedTimeHigh) or tfPhTime != lastProcessedTimeHigh)
+    bool newLow  = not na(pl) and (na(lastProcessedTimeLow)  or tfPlTime != lastProcessedTimeLow)
+
+    // === SAME CANDLE ===
+    bool sameCandle = newHigh and newLow and tfPhTime == tfPlTime
+
+    if sameCandle
+        // Determine order using previous structure (fallback-safe)
+        last = array.size(swings) > 0 ? array.get(swings, 0) : na
+        highFirst = not na(last) ? last.swingType == -1 : true  // if last was low → high comes first
+
+        if highFirst
+            // HIGH → LOW
+            s1 = process(atrVal,swings,true, ph, tfPhTime,tfPhidx,tfPhopen,tfPhclose,tfPhLow, 1, col,drawBool)
+            s2 = process(atrVal,swings,true, pl, tfPlTime,tfPlidx,tfPlopen, tfPlclose,tfPlHigh, -1, col,drawBool)
+            newSwing := s2
+        else
+            // LOW → HIGH
+            s1 = process(atrVal,swings,true, pl, tfPlTime,tfPlidx,tfPlopen,tfPlclose,tfPlHigh, -1, col,drawBool)
+            s2 = process(atrVal,swings,true, ph, tfPhTime,tfPhidx,tfPhopen,tfPhclose,tfPhLow, 1, col,drawBool)
+            newSwing := s2
+
+        // mark both as processed
+        lastProcessedTimeHigh := tfPhTime
+        lastProcessedTimeLow  := tfPlTime
+
+    // === DIFFERENT EVENTS ===
+    else
+        // Process in chronological order if both exist
+        if newHigh and newLow
+            if tfPhTime < tfPlTime
+                s1 = process(atrVal,swings,true, ph, tfPhTime,tfPhidx,tfPhopen,tfPhclose,tfPhLow, 1, col,drawBool)
+                s2 = process(atrVal,swings,true, pl, tfPlTime,tfPlidx,tfPlopen,tfPlclose,tfPlHigh, -1, col,drawBool)
+                newSwing := s2
+            else
+                s1 = process(atrVal,swings,true, pl, tfPlTime,tfPlidx,tfPlopen,tfPlclose,tfPlHigh, -1, col,drawBool)
+                s2 = process(atrVal,swings,true, ph, tfPhTime,tfPhidx,tfPhopen, tfPhclose,tfPhLow, 1, col,drawBool)
+                newSwing := s2
+
+            lastProcessedTimeHigh := tfPhTime
+            lastProcessedTimeLow  := tfPlTime
+
+        else
+            // === Only HIGH ===
+            if newHigh
+                newSwing := process(atrVal,swings,true, ph, tfPhTime,tfPhidx,tfPhopen,tfPhclose,tfPhLow, 1, col,drawBool)
+                lastProcessedTimeHigh := tfPhTime
+
+            // === Only LOW ===
+            if newLow
+                tmp = process(atrVal,swings,true, pl, tfPlTime,tfPlidx,tfPhopen,tfPlclose,tfPlHigh, -1, col,drawBool)
+                newSwing := na(newSwing) ? tmp : newSwing
+                lastProcessedTimeLow  := tfPlTime
+            if not newLow and not newHigh
+                newSwing := process(atrVal,swings,true)
+    newSwing
+var tf0Swings = array.new<Swing>()
+var tf1Swings = array.new<Swing>()
+var tf2Swings = array.new<Swing>()
+atr = ta.atr(14)
+// =========================
+// Main Chart TF Fractals
+// =========================
+
+[tf0Ph,tf0Pl,tf0PhTime,tf0PlTime,tf0phidx, tf0plidx, tf0phClose, tf0plClose, tf0phLow, tf0plHigh, tf0phOpen, tf0plOpen]=getTFPivots(length)
+tf0Swing = processSwing(atr,tf0Swings,tf0Ph, tf0Pl,tf0PhTime, tf0PlTime,tf0phidx, tf0plidx, tf0phOpen, tf0plOpen, tf0phClose, tf0plClose, tf0phLow, tf0plHigh, color.blue,false)
+plotshape(tf0Ph,style=shape.triangledown,location=location.abovebar,color=color.red,offset=-length)
+plotshape(tf0Pl,style=shape.triangleup,location=location.belowbar,color=color.green,offset=-length)
+if array.size(tf0Swings) > 150
+    array.pop(tf0Swings)
+// =========================
+// Higher TF Fractals
+// =========================
+
+//[tf1Ph, tf1Pl,tf1PhTime, tf1PlTime, tf1phidx, tf1plidx, tf1phClose, tf1plClose, tf1phLow, tf1plHigh, tf1phOpen, tf1plOpen] = request.security(syminfo.tickerid, tf1, fs.getTFPivots(length))//,lookahead = barmerge.lookahead_off)
+//tf1swing = fs.processSwing(atr,tf1Swings,tf1Ph, tf1Pl,tf1PhTime, tf1PlTime, tf1phidx, tf1plidx, tf1phOpen, tf1plOpen, tf1phClose, tf1plClose, tf1phLow, tf1plHigh, color.green,true)
+//if array.size(tf1Swings) > 150
+//    array.pop(tf1Swings)
+
+//[tf2Ph, tf2Pl, tf2PhTime, tf2PlTime,tf2phidx, tf2plidx, tf2phClose, tf2plClose, tf2phLow, tf2plHigh, tf2phOpen, tf2plOpen] = request.security(syminfo.tickerid, tf2, fs.getTFPivots(length))//,lookahead = barmerge.lookahead_off)
+//tf2swing = fs.processSwing(atr,tf2Swings,tf2Ph, tf2Pl,tf2PhTime, tf2PlTime, tf2phidx, tf2plidx, tf2phOpen, tf2plOpen, tf2phClose, tf2plClose, tf2phLow, tf2plHigh,color.yellow,true)
+//if array.size(tf2Swings) > 150
+//    array.pop(tf2Swings)
