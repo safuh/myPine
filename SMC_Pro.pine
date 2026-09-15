@@ -1,0 +1,395 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © safuh8
+//@version=6
+
+indicator("SMC Pro", "SMC Pro", overlay = true, max_lines_count = 500, max_boxes_count = 300, max_labels_count = 300)
+
+// ============================================================================
+// SMC Pro — production-oriented market-structure indicator
+// Design principles:
+// 1. Confirmed pivots only: no lookahead/repainting from future bars.
+// 2. Close-based BOS/CHoCH by default; optional wick confirmation.
+// 3. Structure state is independent from drawing state.
+// 4. Protected swings are explicit and remain valid until invalidated.
+// 5. FVGs, order blocks, liquidity pools and sweeps use bounded arrays.
+// 6. HTF structure is requested with lookahead_off and processed only once.
+// ============================================================================
+
+// ----------------------------- Inputs ---------------------------------------
+groupStruct = "01. Structure"
+pivotLen = input.int(2, "Fractal length", minval = 1, maxval = 10, group = groupStruct)
+confirmMode = input.string("Close", "Break confirmation", options = ["Close", "Wick"], group = groupStruct)
+atrLen = input.int(14, "ATR length", minval = 1, group = groupStruct)
+breakAtr = input.float(0.10, "Break buffer (ATR)", minval = 0.0, step = 0.01, group = groupStruct, tooltip = "Small buffer filters marginal price breaches. Set 0 for exact level breaks.")
+showInternal = input.bool(true, "Show internal structure", group = groupStruct)
+showExternal = input.bool(true, "Show external structure", group = groupStruct)
+maxStructure = input.int(80, "Structure history", minval = 20, maxval = 150, group = groupStruct)
+
+ groupFvg = "02. Fair Value Gaps"
+showFvg = input.bool(true, "Show FVGs", group = groupFvg)
+fvgMinAtr = input.float(0.10, "Minimum FVG size (ATR)", minval = 0.0, step = 0.01, group = groupFvg)
+fvgExtend = input.int(30, "FVG extension bars", minval = 1, maxval = 200, group = groupFvg)
+removeFilledFvg = input.bool(true, "Remove filled FVGs", group = groupFvg)
+
+ groupOb = "03. Order Blocks"
+showOb = input.bool(true, "Show order blocks", group = groupOb)
+obLookback = input.int(12, "OB search lookback", minval = 1, maxval = 50, group = groupOb)
+obMinImpulseAtr = input.float(0.50, "Minimum displacement (ATR)", minval = 0.0, step = 0.05, group = groupOb)
+obExtend = input.int(40, "OB extension bars", minval = 1, maxval = 200, group = groupOb)
+
+ groupLiq = "04. Liquidity"
+showLiquidity = input.bool(true, "Show liquidity pools", group = groupLiq)
+showSweeps = input.bool(true, "Show liquidity sweeps", group = groupLiq)
+eqToleranceAtr = input.float(0.12, "Equal high/low tolerance (ATR)", minval = 0.0, step = 0.01, group = groupLiq)
+liqMaxAge = input.int(150, "Liquidity max age (bars)", minval = 10, maxval = 1000, group = groupLiq)
+
+ groupHtf = "05. Higher Timeframe"
+showHtf = input.bool(true, "Show HTF structure", group = groupHtf)
+htf = input.timeframe("240", "HTF", group = groupHtf)
+htfPivotLen = input.int(2, "HTF fractal length", minval = 1, maxval = 10, group = groupHtf)
+
+ groupRisk = "06. Signals"
+showSignals = input.bool(true, "Show confluence signals", group = groupRisk)
+retestAtr = input.float(0.15, "Retest tolerance (ATR)", minval = 0.0, step = 0.01, group = groupRisk)
+showPremiumDiscount = input.bool(true, "Show premium/discount", group = groupRisk)
+
+// ----------------------------- Types ----------------------------------------
+type Swing
+    float price
+    int time
+    int index
+    int kind                 // 1 = high, -1 = low
+    bool broken
+    bool protected
+    bool invalidated
+    int breakTime
+    int breakIndex
+    float breakPrice
+    float extreme
+    int extremeTime
+
+type Zone
+    box id
+    float top
+    float bottom
+    int born
+    bool bullish
+    bool active
+
+type Pool
+    line id
+    float price
+    int time
+    bool highPool
+    bool swept
+    bool active
+
+// ----------------------------- Utilities ------------------------------------
+atr = ta.atr(atrLen)
+confirmed = barstate.isconfirmed
+breakUp(level) =>
+    confirmMode == "Close" ? close > level + atr * breakAtr : high > level + atr * breakAtr
+breakDn(level) =>
+    confirmMode == "Close" ? close < level - atr * breakAtr : low < level - atr * breakAtr
+
+// ----------------------------- Storage --------------------------------------
+var array<Swing> highs = array.new<Swing>()
+var array<Swing> lows = array.new<Swing>()
+var array<Zone> fvgZones = array.new<Zone>()
+var array<Zone> obZones = array.new<Zone>()
+var array<Pool> pools = array.new<Pool>()
+
+var int structureBias = 0
+var float lastBrokenHigh = na
+var float lastBrokenLow = na
+var int lastBosTime = na
+var int lastChochTime = na
+var int lastSignalTime = na
+
+// ----------------------------- Pivot ingestion ------------------------------
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+if confirmed and not na(ph)
+    s = Swing.new(ph, time[pivotLen], bar_index - pivotLen, 1, false, false, false, na, na, na, ph, time[pivotLen])
+    array.unshift(highs, s)
+    if array.size(highs) > maxStructure
+        array.pop(highs)
+
+if confirmed and not na(pl)
+    s = Swing.new(pl, time[pivotLen], bar_index - pivotLen, -1, false, false, false, na, na, na, pl, time[pivotLen])
+    array.unshift(lows, s)
+    if array.size(lows) > maxStructure
+        array.pop(lows)
+
+// ----------------------------- Structure engine -----------------------------
+// The nearest unbroken pivot is the structural candidate. Older unbroken
+// pivots remain available; a broken pivot never masks an older candidate.
+var bool bosUp = false
+var bool bosDn = false
+var bool chochUp = false
+var bool chochDn = false
+bosUp := false
+bosDn := false
+chochUp := false
+chochDn := false
+
+if confirmed and array.size(highs) > 0
+    for i = 0 to array.size(highs) - 1
+        s = array.get(highs, i)
+        if s.invalidated or s.broken
+            continue
+        if breakUp(s.price)
+            s.broken := true
+            s.breakTime := time
+            s.breakIndex := bar_index
+            s.breakPrice := confirmMode == "Close" ? close : high
+            s.protected := true
+            array.set(highs, i, s)
+            lastBrokenHigh := s.price
+            lastBosTime := time
+            bosUp := true
+            chochUp := structureBias < 0
+            structureBias := 1
+            break
+
+if confirmed and array.size(lows) > 0
+    for i = 0 to array.size(lows) - 1
+        s = array.get(lows, i)
+        if s.invalidated or s.broken
+            continue
+        if breakDn(s.price)
+            s.broken := true
+            s.breakTime := time
+            s.breakIndex := bar_index
+            s.breakPrice := confirmMode == "Close" ? close : low
+            s.protected := true
+            array.set(lows, i, s)
+            lastBrokenLow := s.price
+            lastBosTime := time
+            bosDn := true
+            chochDn := structureBias > 0
+            structureBias := -1
+            break
+
+// Protected swing = latest opposite pivot formed before the structural break.
+// It is invalidated only after an opposite break through its level.
+if confirmed and structureBias == 1 and array.size(lows) > 0
+    for i = 0 to array.size(lows) - 1
+        s = array.get(lows, i)
+        if s.time < nz(lastBosTime, 0) and not s.invalidated
+            s.protected := true
+            if breakDn(s.price)
+                s.invalidated := true
+                s.protected := false
+                array.set(lows, i, s)
+            break
+
+if confirmed and structureBias == -1 and array.size(highs) > 0
+    for i = 0 to array.size(highs) - 1
+        s = array.get(highs, i)
+        if s.time < nz(lastBosTime, 0) and not s.invalidated
+            s.protected := true
+            if breakUp(s.price)
+                s.invalidated := true
+                s.protected := false
+                array.set(highs, i, s)
+            break
+
+// ----------------------------- Draw structure -------------------------------
+if bosUp and showExternal
+    label.new(bar_index, high, chochUp ? "CHoCH ↑" : "BOS ↑", style = label.style_label_down, textcolor = color.white, color = chochUp ? color.orange : color.green, size = size.tiny)
+if bosDn and showExternal
+    label.new(bar_index, low, chochDn ? "CHoCH ↓" : "BOS ↓", style = label.style_label_up, textcolor = color.white, color = chochDn ? color.orange : color.red, size = size.tiny)
+
+// ----------------------------- Fair Value Gaps -------------------------------
+bullFvg = low > high[2] and (low - high[2]) >= atr * fvgMinAtr
+bearFvg = high < low[2] and (low[2] - high) >= atr * fvgMinAtr
+
+if confirmed and showFvg and bullFvg
+    b = box.new(bar_index - 2, low, bar_index + fvgExtend, high[2], bgcolor = color.new(color.green, 88), border_color = color.new(color.green, 35))
+    array.unshift(fvgZones, Zone.new(b, low, high[2], bar_index, true, true))
+
+if confirmed and showFvg and bearFvg
+    b = box.new(bar_index - 2, low[2], bar_index + fvgExtend, high, bgcolor = color.new(color.red, 88), border_color = color.new(color.red, 35))
+    array.unshift(fvgZones, Zone.new(b, low[2], high, bar_index, false, true))
+
+if array.size(fvgZones) > 80
+    old = array.pop(fvgZones)
+    box.delete(old.id)
+
+if array.size(fvgZones) > 0
+    for i = array.size(fvgZones) - 1 to 0
+        z = array.get(fvgZones, i)
+        if not z.active
+            continue
+        filled = z.bullish ? low <= z.bottom : high >= z.top
+        expired = bar_index - z.born > fvgExtend
+        if filled or expired
+            if removeFilledFvg or expired
+                box.delete(z.id)
+                array.remove(fvgZones, i)
+            else
+                z.active := false
+                array.set(fvgZones, i, z)
+
+// ----------------------------- Order Blocks ---------------------------------
+// A valid OB is the last opposite candle before a confirmed displacement.
+// The displacement must break structure and exceed a configurable ATR size.
+if confirmed and showOb and (bosUp or bosDn)
+    bool bull = bosUp
+    float impulse = bull ? close - open : open - close
+    if impulse >= atr * obMinImpulseAtr
+        int found = na
+        for j = 1 to obLookback
+            if bull and close[j] < open[j]
+                found := j
+                break
+            if not bull and close[j] > open[j]
+                found := j
+                break
+        if not na(found)
+            float top = high[found]
+            float bottom = low[found]
+            b = box.new(bar_index - found, top, bar_index + obExtend, bottom, bgcolor = bull ? color.new(color.green, 90) : color.new(color.red, 90), border_color = bull ? color.new(color.green, 45) : color.new(color.red, 45))
+            array.unshift(obZones, Zone.new(b, top, bottom, bar_index - found, bull, true))
+
+if array.size(obZones) > 40
+    old = array.pop(obZones)
+    box.delete(old.id)
+
+if array.size(obZones) > 0
+    for i = array.size(obZones) - 1 to 0
+        z = array.get(obZones, i)
+        if not z.active
+            continue
+        invalid = z.bullish ? close < z.bottom : close > z.top
+        expired = bar_index - z.born > obExtend
+        if invalid or expired
+            box.delete(z.id)
+            array.remove(obZones, i)
+
+// ----------------------------- Equal highs/lows + sweeps --------------------
+newPoolHigh = false
+newPoolLow = false
+if confirmed and not na(ph) and array.size(highs) > 1
+    // Compare only against a small recent set to keep execution bounded.
+    lim = math.min(array.size(highs) - 1, 8)
+    for i = 1 to lim
+        old = array.get(highs, i)
+        if math.abs(ph - old.price) <= atr * eqToleranceAtr and bar_index - old.index <= liqMaxAge
+            p = line.new(old.time, old.price, time[pivotLen], ph, xloc = xloc.bar_time, color = color.new(color.red, 25), style = line.style_dashed, width = 1)
+            array.unshift(pools, Pool.new(p, ph, time[pivotLen], true, false, true))
+            newPoolHigh := true
+            break
+
+if confirmed and not na(pl) and array.size(lows) > 1
+    lim = math.min(array.size(lows) - 1, 8)
+    for i = 1 to lim
+        old = array.get(lows, i)
+        if math.abs(pl - old.price) <= atr * eqToleranceAtr and bar_index - old.index <= liqMaxAge
+            p = line.new(old.time, old.price, time[pivotLen], pl, xloc = xloc.bar_time, color = color.new(color.green, 25), style = line.style_dashed, width = 1)
+            array.unshift(pools, Pool.new(p, pl, time[pivotLen], false, false, true))
+            newPoolLow := true
+            break
+
+if array.size(pools) > 60
+    old = array.pop(pools)
+    line.delete(old.id)
+
+sweepHigh = false
+sweepLow = false
+if confirmed and showSweeps and array.size(pools) > 0
+    for i = array.size(pools) - 1 to 0
+        p = array.get(pools, i)
+        if not p.active or p.swept
+            continue
+        if p.highPool and high > p.price and close < p.price
+            p.swept := true
+            line.set_x2(p.id, time)
+            array.set(pools, i, p)
+            sweepHigh := true
+        if not p.highPool and low < p.price and close > p.price
+            p.swept := true
+            line.set_x2(p.id, time)
+            array.set(pools, i, p)
+            sweepLow := true
+
+if sweepHigh and showSweeps
+    label.new(bar_index, high, "SSL/BSL sweep ↓", style = label.style_label_down, color = color.red, textcolor = color.white, size = size.tiny)
+if sweepLow and showSweeps
+    label.new(bar_index, low, "SSL/BSL sweep ↑", style = label.style_label_up, color = color.green, textcolor = color.white, size = size.tiny)
+
+// ----------------------------- Retest/confluence ----------------------------
+// Retest is level proximity after a confirmed break, not a requirement that
+// price touch the exact protected price. ATR tolerance handles real-market
+// overshoot/undershoot without changing the structural level itself.
+float protectedLevel = na
+if structureBias == 1 and array.size(lows) > 0
+    for i = 0 to array.size(lows) - 1
+        s = array.get(lows, i)
+        if s.protected and not s.invalidated
+            protectedLevel := s.price
+            break
+if structureBias == -1 and array.size(highs) > 0
+    for i = 0 to array.size(highs) - 1
+        s = array.get(highs, i)
+        if s.protected and not s.invalidated
+            protectedLevel := s.price
+            break
+
+retestLong = structureBias == 1 and not na(protectedLevel) and low <= protectedLevel + atr * retestAtr and close > protectedLevel
+retestShort = structureBias == -1 and not na(protectedLevel) and high >= protectedLevel - atr * retestAtr and close < protectedLevel
+
+signalLong = showSignals and confirmed and (bosUp or sweepLow) and (retestLong or bullFvg)
+signalShort = showSignals and confirmed and (bosDn or sweepHigh) and (retestShort or bearFvg)
+
+if signalLong and lastSignalTime != time
+    label.new(bar_index, low, "SMC LONG", style = label.style_label_up, color = color.green, textcolor = color.white, size = size.small)
+    lastSignalTime := time
+if signalShort and lastSignalTime != time
+    label.new(bar_index, high, "SMC SHORT", style = label.style_label_down, color = color.red, textcolor = color.white, size = size.small)
+    lastSignalTime := time
+
+// ----------------------------- Premium / discount ---------------------------
+var line eqLine = na
+var line premiumLine = na
+var line discountLine = na
+if showPremiumDiscount and structureBias != 0 and array.size(highs) > 0 and array.size(lows) > 0
+    float hi = array.get(highs, 0).price
+    float lo = array.get(lows, 0).price
+    if not na(hi) and not na(lo) and hi > lo
+        mid = (hi + lo) / 2.0
+        if na(eqLine)
+            eqLine := line.new(bar_index, mid, bar_index + 1, mid, extend = extend.right, color = color.new(color.gray, 55), style = line.style_dotted)
+        else
+            line.set_xy1(eqLine, bar_index, mid)
+            line.set_xy2(eqLine, bar_index + 1, mid)
+
+// ----------------------------- HTF structure --------------------------------
+// Request only confirmed HTF pivot events. A pivot appears pivotLen bars after
+// its actual HTF candle; lookahead_off prevents future leakage.
+[htfPh, htfPl, htfPhTime, htfPlTime] = request.security(syminfo.tickerid, htf, [ta.pivothigh(high, htfPivotLen, htfPivotLen), ta.pivotlow(low, htfPivotLen, htfPivotLen), not na(ta.pivothigh(high, htfPivotLen, htfPivotLen)) ? time[htfPivotLen] : na, not na(ta.pivotlow(low, htfPivotLen, htfPivotLen)) ? time[htfPivotLen] : na], lookahead = barmerge.lookahead_off)
+var int lastHtfHighTime = na
+var int lastHtfLowTime = na
+if showHtf and confirmed
+    if not na(htfPh) and htfPhTime != lastHtfHighTime
+        label.new(bar_index, high, "HTF H", style = label.style_label_down, color = color.new(color.orange, 25), textcolor = color.white, size = size.tiny)
+        lastHtfHighTime := htfPhTime
+    if not na(htfPl) and htfPlTime != lastHtfLowTime
+        label.new(bar_index, low, "HTF L", style = label.style_label_up, color = color.new(color.orange, 25), textcolor = color.white, size = size.tiny)
+        lastHtfLowTime := htfPlTime
+
+// ----------------------------- Visual pivots --------------------------------
+plotshape(showInternal and not na(ph), title = "Swing High", style = shape.triangledown, location = location.abovebar, offset = -pivotLen, size = size.tiny, color = color.new(color.red, 25))
+plotshape(showInternal and not na(pl), title = "Swing Low", style = shape.triangleup, location = location.belowbar, offset = -pivotLen, size = size.tiny, color = color.new(color.green, 25))
+
+// ----------------------------- Alerts ---------------------------------------
+alertcondition(bosUp, "BOS Bullish", "SMC Pro: bullish BOS")
+alertcondition(bosDn, "BOS Bearish", "SMC Pro: bearish BOS")
+alertcondition(chochUp, "CHoCH Bullish", "SMC Pro: bullish CHoCH")
+alertcondition(chochDn, "CHoCH Bearish", "SMC Pro: bearish CHoCH")
+alertcondition(sweepLow, "Sell-side Liquidity Sweep", "SMC Pro: sell-side liquidity swept")
+alertcondition(sweepHigh, "Buy-side Liquidity Sweep", "SMC Pro: buy-side liquidity swept")
+alertcondition(signalLong, "SMC Long Confluence", "SMC Pro: long confluence")
+alertcondition(signalShort, "SMC Short Confluence", "SMC Pro: short confluence")
