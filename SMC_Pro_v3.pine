@@ -1,0 +1,513 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © safuh8
+//@version=6
+
+indicator("SMC Pro v3", "SMC Pro v3", overlay = true, max_lines_count = 500, max_boxes_count = 300, max_labels_count = 300)
+
+// ============================================================================
+// SMC Pro v3 — price-chart overlay
+//
+// Visual philosophy:
+//   • Structure is drawn directly on the candles.
+//   • Labels describe what happened instead of exposing implementation terms.
+//   • Zones remain attached to price: FVG, Order Block and protected levels.
+//   • Retests are post-break state events, not same-candle conditions.
+// ============================================================================
+
+// ----------------------------- Inputs ---------------------------------------
+gStructure = "01. Market Structure"
+pivotLen = input.int(2, "Swing sensitivity", minval = 1, maxval = 10, group = gStructure)
+confirmMode = input.string("Close", "Break confirmation", options = ["Close", "Wick"], group = gStructure)
+atrLen = input.int(14, "ATR length", minval = 1, group = gStructure)
+breakAtr = input.float(0.10, "Break buffer", minval = 0, step = 0.01, group = gStructure)
+showStructure = input.bool(true, "Show structure", group = gStructure)
+showSwingPoints = input.bool(false, "Show swing points", group = gStructure)
+maxStructure = input.int(100, "Structure history", minval = 20, maxval = 200, group = gStructure)
+
+labelMode = input.string("Descriptive", "Label style", options = ["Compact", "Descriptive"], group = gStructure, tooltip = "Compact uses BOS/CHoCH/EQH/EQL. Descriptive uses plain-language labels.")
+
+// ----------------------------- Retest ---------------------------------------
+gRetest = "02. Structure Retest"
+showRetest = input.bool(true, "Show retests", group = gRetest)
+retestToleranceAtr = input.float(0.20, "Retest zone tolerance", minval = 0, step = 0.01, group = gRetest)
+retestInvalidAtr = input.float(0.20, "Retest invalidation", minval = 0, step = 0.01, group = gRetest)
+retestMaxBars = input.int(30, "Retest window", minval = 1, maxval = 200, group = gRetest)
+requireRejection = input.bool(true, "Require rejection close", group = gRetest)
+showProtected = input.bool(true, "Show protected level", group = gRetest)
+
+// ----------------------------- FVG ------------------------------------------
+gFvg = "03. Fair Value Gaps"
+showFvg = input.bool(true, "Show FVGs", group = gFvg)
+fvgMinAtr = input.float(0.10, "Minimum FVG size", minval = 0, step = 0.01, group = gFvg)
+fvgExtend = input.int(30, "FVG extension", minval = 1, maxval = 200, group = gFvg)
+removeFilledFvg = input.bool(true, "Remove filled FVGs", group = gFvg)
+showFvgLabel = input.bool(true, "Label FVGs", group = gFvg)
+
+// ----------------------------- Order Blocks ---------------------------------
+gOb = "04. Order Blocks"
+showOb = input.bool(true, "Show order blocks", group = gOb)
+obLookback = input.int(12, "OB search window", minval = 1, maxval = 50, group = gOb)
+obImpulseAtr = input.float(0.50, "Minimum displacement", minval = 0, step = 0.05, group = gOb)
+obExtend = input.int(40, "OB extension", minval = 1, maxval = 200, group = gOb)
+showObLabel = input.bool(true, "Label order blocks", group = gOb)
+
+// ----------------------------- Liquidity ------------------------------------
+gLiquidity = "05. Liquidity"
+showLiquidity = input.bool(true, "Show liquidity", group = gLiquidity)
+showSweeps = input.bool(true, "Show liquidity sweeps", group = gLiquidity)
+eqToleranceAtr = input.float(0.12, "Equal high/low tolerance", minval = 0, step = 0.01, group = gLiquidity)
+liqMaxAge = input.int(150, "Maximum liquidity age", minval = 10, maxval = 1000, group = gLiquidity)
+
+// ----------------------------- Dealing range --------------------------------
+gRange = "06. Dealing Range"
+showRange = input.bool(true, "Show equilibrium", group = gRange)
+showZones = input.bool(false, "Shade premium / discount", group = gRange)
+
+// ----------------------------- Visuals ---------------------------------------
+colBull = color.rgb(38, 166, 91)
+colBear = color.rgb(239, 83, 80)
+colStructure = color.rgb(255, 152, 0)
+colNeutral = color.rgb(120, 123, 134)
+colFvgBull = color.rgb(0, 188, 212)
+colFvgBear = color.rgb(171, 71, 188)
+colObBull = color.rgb(38, 166, 91)
+colObBear = color.rgb(239, 83, 80)
+
+atr = ta.atr(atrLen)
+safeAtr = math.max(nz(atr, syminfo.mintick), syminfo.mintick)
+confirmed = barstate.isconfirmed
+
+breakUp(float level) =>
+    confirmMode == "Close" ? close > level + safeAtr * breakAtr : high > level + safeAtr * breakAtr
+
+breakDn(float level) =>
+    confirmMode == "Close" ? close < level - safeAtr * breakAtr : low < level - safeAtr * breakAtr
+
+fmt(string compact, string descriptive) =>
+    labelMode == "Compact" ? compact : descriptive
+
+// ============================================================================
+// Types
+// ============================================================================
+type Swing
+    float price
+    int time
+    int index
+    bool broken
+    bool protected
+    bool invalidated
+    int breakIndex
+    int breakTime
+    float breakPrice
+
+type Zone
+    box id
+    float top
+    float bottom
+    int born
+    bool bullish
+    bool active
+
+type Pool
+    line id
+    float price
+    int born
+    bool highPool
+    bool swept
+    bool active
+
+// ============================================================================
+// State
+// ============================================================================
+var array<Swing> highs = array.new<Swing>()
+var array<Swing> lows = array.new<Swing>()
+var array<Zone> fvgZones = array.new<Zone>()
+var array<Zone> obZones = array.new<Zone>()
+var array<Pool> pools = array.new<Pool>()
+
+var int bias = 0
+var float protectedLevel = na
+var int protectedIndex = na
+var int protectedBreakIndex = na
+var int retestState = 0
+var int retestStartIndex = na
+var bool retestTouched = false
+var int lastRetestLabelIndex = na
+
+var float dealingHigh = na
+var float dealingLow = na
+var line equilibriumLine = na
+
+// ============================================================================
+// Confirmed swing ingestion
+// ============================================================================
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+if confirmed and not na(ph)
+    array.unshift(highs, Swing.new(ph, time[pivotLen], bar_index - pivotLen, false, false, false, na, na, na))
+    if array.size(highs) > maxStructure
+        array.pop(highs)
+
+if confirmed and not na(pl)
+    array.unshift(lows, Swing.new(pl, time[pivotLen], bar_index - pivotLen, false, false, false, na, na, na))
+    if array.size(lows) > maxStructure
+        array.pop(lows)
+
+// ============================================================================
+// Structure event detection
+// ============================================================================
+bosUp = false
+bosDn = false
+chochUp = false
+chochDn = false
+
+highBreak = false
+lowBreak = false
+int highAge = na
+int lowAge = na
+
+if confirmed and array.size(highs) > 0
+    for i = 0 to array.size(highs) - 1
+        s = array.get(highs, i)
+        if not s.broken and not s.invalidated and breakUp(s.price)
+            highBreak := true
+            highAge := bar_index - s.index
+            break
+
+if confirmed and array.size(lows) > 0
+    for i = 0 to array.size(lows) - 1
+        s = array.get(lows, i)
+        if not s.broken and not s.invalidated and breakDn(s.price)
+            lowBreak := true
+            lowAge := bar_index - s.index
+            break
+
+// If both sides break on one confirmed candle, process the older pivot first.
+processHigh = highBreak and (not lowBreak or highAge <= lowAge)
+processLow = lowBreak and (not highBreak or lowAge < highAge)
+
+if processHigh
+    for i = 0 to array.size(highs) - 1
+        s = array.get(highs, i)
+        if not s.broken and not s.invalidated and breakUp(s.price)
+            s.broken := true
+            s.breakIndex := bar_index
+            s.breakTime := time
+            s.breakPrice := confirmMode == "Close" ? close : high
+            array.set(highs, i, s)
+            bosUp := true
+            chochUp := bias < 0
+            bias := 1
+            break
+
+if processLow
+    for i = 0 to array.size(lows) - 1
+        s = array.get(lows, i)
+        if not s.broken and not s.invalidated and breakDn(s.price)
+            s.broken := true
+            s.breakIndex := bar_index
+            s.breakTime := time
+            s.breakPrice := confirmMode == "Close" ? close : low
+            array.set(lows, i, s)
+            bosDn := true
+            chochDn := bias > 0
+            bias := -1
+            break
+
+// ============================================================================
+// Protected swing and retest state
+// ============================================================================
+if bosUp
+    protectedLevel := na
+    protectedIndex := na
+    for i = 0 to array.size(lows) - 1
+        s = array.get(lows, i)
+        if s.time < time and not s.invalidated
+            protectedLevel := s.price
+            protectedIndex := s.index
+            s.protected := true
+            array.set(lows, i, s)
+            break
+    protectedBreakIndex := bar_index
+    retestState := not na(protectedLevel) ? 1 : 0
+    retestStartIndex := bar_index
+    retestTouched := false
+
+if bosDn
+    protectedLevel := na
+    protectedIndex := na
+    for i = 0 to array.size(highs) - 1
+        s = array.get(highs, i)
+        if s.time < time and not s.invalidated
+            protectedLevel := s.price
+            protectedIndex := s.index
+            s.protected := true
+            array.set(highs, i, s)
+            break
+    protectedBreakIndex := bar_index
+    retestState := not na(protectedLevel) ? -1 : 0
+    retestStartIndex := bar_index
+    retestTouched := false
+
+// Retest is deliberately post-break only. A wick can enter the retest zone
+// without requiring an exact tick touch of the protected price.
+retestLong = false
+retestShort = false
+
+if confirmed and retestState != 0 and bar_index > retestStartIndex
+    barsInWindow = bar_index - retestStartIndex
+    tolerance = safeAtr * retestToleranceAtr
+    invalidation = safeAtr * retestInvalidAtr
+
+    invalidLong = close < protectedLevel - invalidation
+    invalidShort = close > protectedLevel + invalidation
+
+    if barsInWindow > retestMaxBars or (retestState == 1 and invalidLong) or (retestState == -1 and invalidShort)
+        retestState := 0
+    else if retestState == 1
+        touched = low <= protectedLevel + tolerance and low >= protectedLevel - invalidation
+        if touched
+            retestTouched := true
+        rejected = not requireRejection or close > protectedLevel
+        if retestTouched and rejected
+            retestLong := true
+            retestState := 0
+    else
+        touched = high >= protectedLevel - tolerance and high <= protectedLevel + invalidation
+        if touched
+            retestTouched := true
+        rejected = not requireRejection or close < protectedLevel
+        if retestTouched and rejected
+            retestShort := true
+            retestState := 0
+
+// Protect against a completed structural invalidation even when no retest is
+// pending. The protected swing remains a historical fact but loses its status.
+if confirmed and bias == 1 and not na(protectedLevel) and breakDn(protectedLevel)
+    if not na(protectedIndex)
+        for i = 0 to array.size(lows) - 1
+            s = array.get(lows, i)
+            if s.index == protectedIndex
+                s.invalidated := true
+                s.protected := false
+                array.set(lows, i, s)
+                break
+    if retestState == 1
+        retestState := 0
+
+if confirmed and bias == -1 and not na(protectedLevel) and breakUp(protectedLevel)
+    if not na(protectedIndex)
+        for i = 0 to array.size(highs) - 1
+            s = array.get(highs, i)
+            if s.index == protectedIndex
+                s.invalidated := true
+                s.protected := false
+                array.set(highs, i, s)
+                break
+    if retestState == -1
+        retestState := 0
+
+// ============================================================================
+// Structure labels — attached to the price event, not placed in a separate
+// indicator pane.
+// ============================================================================
+if showStructure and bosUp
+    txt = chochUp ? fmt("CHoCH ↑", "Bullish CHoCH") : fmt("BOS ↑", "Bullish BOS")
+    label.new(bar_index, low, txt, style = label.style_label_up, color = chochUp ? colStructure : colBull, textcolor = color.white, size = size.tiny)
+
+if showStructure and bosDn
+    txt = chochDn ? fmt("CHoCH ↓", "Bearish CHoCH") : fmt("BOS ↓", "Bearish BOS")
+    label.new(bar_index, high, txt, style = label.style_label_down, color = chochDn ? colStructure : colBear, textcolor = color.white, size = size.tiny)
+
+if showRetest and retestLong and lastRetestLabelIndex != bar_index
+    label.new(bar_index, low, fmt("RETEST ↑", "Bullish Retest"), style = label.style_label_up, color = colBull, textcolor = color.white, size = size.tiny)
+    lastRetestLabelIndex := bar_index
+
+if showRetest and retestShort and lastRetestLabelIndex != bar_index
+    label.new(bar_index, high, fmt("RETEST ↓", "Bearish Retest"), style = label.style_label_down, color = colBear, textcolor = color.white, size = size.tiny)
+    lastRetestLabelIndex := bar_index
+
+// ============================================================================
+// FVGs — price-attached zones
+// ============================================================================
+bullFvg = not na(high[2]) and low > high[2] and low - high[2] >= safeAtr * fvgMinAtr
+bearFvg = not na(low[2]) and high < low[2] and low[2] - high >= safeAtr * fvgMinAtr
+
+if confirmed and showFvg and bullFvg
+    b = box.new(bar_index - 2, low, bar_index + fvgExtend, high[2], bgcolor = color.new(colFvgBull, 88), border_color = color.new(colFvgBull, 45))
+    array.unshift(fvgZones, Zone.new(b, low, high[2], bar_index, true, true))
+    if showFvgLabel
+        label.new(bar_index - 1, (low + high[2]) / 2, fmt("FVG", "Fair Value Gap"), style = label.style_none, textcolor = colFvgBull, size = size.tiny)
+
+if confirmed and showFvg and bearFvg
+    b = box.new(bar_index - 2, low[2], bar_index + fvgExtend, high, bgcolor = color.new(colFvgBear, 88), border_color = color.new(colFvgBear, 45))
+    array.unshift(fvgZones, Zone.new(b, low[2], high, bar_index, false, true))
+    if showFvgLabel
+        label.new(bar_index - 1, (low[2] + high) / 2, fmt("FVG", "Fair Value Gap"), style = label.style_none, textcolor = colFvgBear, size = size.tiny)
+
+if array.size(fvgZones) > 80
+    z = array.pop(fvgZones)
+    box.delete(z.id)
+
+if array.size(fvgZones) > 0
+    for i = array.size(fvgZones) - 1 to 0
+        z = array.get(fvgZones, i)
+        if z.active
+            filled = z.bullish ? low <= z.bottom : high >= z.top
+            expired = bar_index - z.born > fvgExtend
+            if filled or expired
+                if removeFilledFvg or expired
+                    box.delete(z.id)
+                    array.remove(fvgZones, i)
+                else
+                    z.active := false
+                    array.set(fvgZones, i, z)
+
+// ============================================================================
+// Order blocks — last opposing candle before a qualified displacement
+// ============================================================================
+if confirmed and showOb and (bosUp or bosDn)
+    bull = bosUp
+    impulse = bull ? close - open : open - close
+    if impulse >= safeAtr * obImpulseAtr
+        int found = na
+        for j = 1 to obLookback
+            opposite = bull ? close[j] < open[j] : close[j] > open[j]
+            if opposite
+                found := j
+                break
+        if not na(found)
+            top = high[found]
+            bottom = low[found]
+            b = box.new(bar_index - found, top, bar_index + obExtend, bottom, bgcolor = color.new(bull ? colObBull : colObBear, 90), border_color = color.new(bull ? colObBull : colObBear, 45))
+            array.unshift(obZones, Zone.new(b, top, bottom, bar_index - found, bull, true))
+            if showObLabel
+                label.new(bar_index - found, bull ? bottom : top, bull ? fmt("Bullish OB", "Bullish Order Block") : fmt("Bearish OB", "Bearish Order Block"), style = bull ? label.style_label_up : label.style_label_down, color = bull ? colObBull : colObBear, textcolor = color.white, size = size.tiny)
+
+if array.size(obZones) > 40
+    z = array.pop(obZones)
+    box.delete(z.id)
+
+if array.size(obZones) > 0
+    for i = array.size(obZones) - 1 to 0
+        z = array.get(obZones, i)
+        if z.active
+            invalid = z.bullish ? close < z.bottom : close > z.top
+            expired = bar_index - z.born > obExtend
+            if invalid or expired
+                box.delete(z.id)
+                array.remove(obZones, i)
+
+// ============================================================================
+// Equal highs/lows and liquidity sweeps
+// ============================================================================
+if confirmed and not na(ph) and array.size(highs) > 1
+    lim = math.min(array.size(highs) - 1, 8)
+    for i = 1 to lim
+        old = array.get(highs, i)
+        if math.abs(ph - old.price) <= safeAtr * eqToleranceAtr and bar_index - old.index <= liqMaxAge
+            if showLiquidity
+                l = line.new(old.time, old.price, time[pivotLen], ph, xloc = xloc.bar_time, color = color.new(colBear, 35), style = line.style_dashed, width = 1)
+                array.unshift(pools, Pool.new(l, ph, bar_index, true, false, true))
+                label.new(bar_index - pivotLen, ph, fmt("EQH", "Equal High"), style = label.style_label_down, color = color.new(colBear, 15), textcolor = color.white, size = size.tiny)
+            break
+
+if confirmed and not na(pl) and array.size(lows) > 1
+    lim = math.min(array.size(lows) - 1, 8)
+    for i = 1 to lim
+        old = array.get(lows, i)
+        if math.abs(pl - old.price) <= safeAtr * eqToleranceAtr and bar_index - old.index <= liqMaxAge
+            if showLiquidity
+                l = line.new(old.time, old.price, time[pivotLen], pl, xloc = xloc.bar_time, color = color.new(colBull, 35), style = line.style_dashed, width = 1)
+                array.unshift(pools, Pool.new(l, pl, bar_index, false, false, true))
+                label.new(bar_index - pivotLen, pl, fmt("EQL", "Equal Low"), style = label.style_label_up, color = color.new(colBull, 15), textcolor = color.white, size = size.tiny)
+            break
+
+if array.size(pools) > 60
+    p = array.pop(pools)
+    line.delete(p.id)
+
+sweepHigh = false
+sweepLow = false
+if confirmed and showSweeps and array.size(pools) > 0
+    for i = array.size(pools) - 1 to 0
+        p = array.get(pools, i)
+        if p.active and not p.swept and bar_index - p.born <= liqMaxAge
+            if p.highPool and high > p.price and close < p.price
+                p.swept := true
+                line.set_x2(p.id, time)
+                array.set(pools, i, p)
+                sweepHigh := true
+            else if not p.highPool and low < p.price and close > p.price
+                p.swept := true
+                line.set_x2(p.id, time)
+                array.set(pools, i, p)
+                sweepLow := true
+
+if sweepHigh and showSweeps
+    label.new(bar_index, high, fmt("BSL SWEEP ↓", "Buy-side Liquidity Sweep"), style = label.style_label_down, color = colBear, textcolor = color.white, size = size.tiny)
+
+if sweepLow and showSweeps
+    label.new(bar_index, low, fmt("SSL SWEEP ↑", "Sell-side Liquidity Sweep"), style = label.style_label_up, color = colBull, textcolor = color.white, size = size.tiny)
+
+// ============================================================================
+// Active dealing range and equilibrium
+// ============================================================================
+if bosUp
+    dealingLow := protectedLevel
+    if array.size(highs) > 0
+        // The broken high is the newest broken structural high.
+        for i = 0 to array.size(highs) - 1
+            s = array.get(highs, i)
+            if s.broken and s.breakIndex == bar_index
+                dealingHigh := s.price
+                break
+
+if bosDn
+    dealingHigh := protectedLevel
+    if array.size(lows) > 0
+        for i = 0 to array.size(lows) - 1
+            s = array.get(lows, i)
+            if s.broken and s.breakIndex == bar_index
+                dealingLow := s.price
+                break
+
+validRange = not na(dealingHigh) and not na(dealingLow) and dealingHigh > dealingLow
+equilibrium = validRange ? (dealingHigh + dealingLow) / 2.0 : na
+
+if showRange and validRange
+    if na(equilibriumLine)
+        equilibriumLine := line.new(bar_index, equilibrium, bar_index + 1, equilibrium, extend = extend.right, color = color.new(colNeutral, 45), style = line.style_dotted, width = 1)
+    else
+        line.set_xy1(equilibriumLine, bar_index, equilibrium)
+        line.set_xy2(equilibriumLine, bar_index + 1, equilibrium)
+else if not showRange and not na(equilibriumLine)
+    line.delete(equilibriumLine)
+    equilibriumLine := na
+
+// Optional lightweight premium/discount background on the active range.
+premium = validRange and close > equilibrium
+discount = validRange and close < equilibrium
+bgcolor(showZones and premium ? color.new(colBear, 94) : showZones and discount ? color.new(colBull, 94) : na)
+
+// ============================================================================
+// Swing points — disabled by default to keep the chart clean
+// ============================================================================
+plotshape(showSwingPoints and not na(ph), title = "Swing High", style = shape.triangledown, location = location.abovebar, offset = -pivotLen, size = size.tiny, color = color.new(colBear, 20))
+plotshape(showSwingPoints and not na(pl), title = "Swing Low", style = shape.triangleup, location = location.belowbar, offset = -pivotLen, size = size.tiny, color = color.new(colBull, 20))
+
+// Protected level is a true price overlay. No separate pane is created.
+plot(showProtected ? protectedLevel : na, title = "Protected Level", color = color.new(color.yellow, 20), linewidth = 1, style = plot.style_linebr)
+
+// ============================================================================
+// Alerts
+// ============================================================================
+alertcondition(bosUp, "Bullish BOS", "SMC Pro: bullish structure break")
+alertcondition(bosDn, "Bearish BOS", "SMC Pro: bearish structure break")
+alertcondition(chochUp, "Bullish CHoCH", "SMC Pro: bullish change of character")
+alertcondition(chochDn, "Bearish CHoCH", "SMC Pro: bearish change of character")
+alertcondition(retestLong, "Bullish Retest", "SMC Pro: bullish protected-level retest")
+alertcondition(retestShort, "Bearish Retest", "SMC Pro: bearish protected-level retest")
+alertcondition(sweepLow, "Sell-side Liquidity Sweep", "SMC Pro: sell-side liquidity swept")
+alertcondition(sweepHigh, "Buy-side Liquidity Sweep", "SMC Pro: buy-side liquidity swept")
